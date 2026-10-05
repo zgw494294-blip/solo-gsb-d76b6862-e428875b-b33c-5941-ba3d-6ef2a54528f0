@@ -60,6 +60,25 @@ docker compose up --build
 保持上传时的原始顺序，每行含 `seq`（从 1 开始）、`id`、`message`。
 未知批次 ID 返回 `404`。
 
+### `GET /logs/search` — 按 message 检索日志
+
+在所有**已提交**批次中按 `message` 做**大小写敏感的字面子串**匹配：
+`%`、`_` 只是普通字符（不是通配符），查询词中的空白原样保留。
+暂存中（尚未提交）的批次不参与检索。
+
+- 首页：`?q=<查询词>&page_size=<1..100>`。查询词长度 1～200 个字符；
+  响应时固定当时已提交的批次范围。
+- 续页：`?cursor=<上一页返回的 next_cursor>&page_size=<1..100>`，
+  沿用首页的查询词与批次范围。`q` 与 `cursor` 必须且只能提供一个。
+- 响应：`items` 中每行含 `batch_id`、`seq`、`id`、`message`，按批次提交
+  顺序、批内 `seq` 升序排列；同一 `id` 出现在多个批次时各行都保留。
+  `next_cursor` 为下一页游标，末页为 `null`；无匹配时 `items` 为空且
+  `next_cursor` 为 `null`。
+- 翻页期间新提交的批次不会混入进行中的查询；重新发起查询即可看到。
+- 游标无状态，服务重启后仍可续用；游标损坏或字段不合法返回 `422`。
+- 检索按页做键集分页：不缓存全量命中行、不跨请求持有数据库事务，
+  WAL 下检索与上传提交互不阻塞。
+
 ## curl 示例
 
 ### 正常：上传并读回
@@ -83,6 +102,44 @@ curl -sS http://localhost:8000/batches
 # 按批次 ID 读行（把 BID 换成上面返回的 batch_id）
 BID=…
 curl -sS "http://localhost:8000/batches/$BID/lines?limit=10&offset=0"
+```
+
+### 检索日志：特殊字符、翻页间上传、重启后续页
+
+```bash
+# 上传两个都含 "error" 的批次（第二个故意在翻页之间上传，见下）
+printf '%s\n' \
+  '{"id":"a","message":"error 100% disk_full"}' \
+  '{"id":"b","message":"error diskXfull"}' \
+  | gzip -n > s1.json.gz
+curl -sS -X POST http://localhost:8000/batches --data-binary @s1.json.gz
+
+# 特殊字符检索：% 与 _ 是字面字符、大小写敏感、空白原样保留
+# （--data-urlencode 负责 URL 编码，查询词里的空格、% 等原样送达）
+curl -sS -G http://localhost:8000/logs/search \
+  --data-urlencode 'q=error 100% disk_full' --data-urlencode 'page_size=10'
+# 只命中 "error 100% disk_full"：_ 不会通配出 "diskXfull"，
+# 小写查询也不会命中大写 "Error"。
+
+# 翻页：首页响应带 next_cursor，续页只带 cursor 与 page_size
+CUR=$(curl -sS -G http://localhost:8000/logs/search \
+  --data-urlencode 'q=error' --data-urlencode 'page_size=1' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["next_cursor"] or "")')
+
+# 翻页之间上传新批次：旧游标继续翻页时看不到它
+printf '%s\n' '{"id":"c","message":"error from new batch"}' | gzip -n > s2.json.gz
+curl -sS -X POST http://localhost:8000/batches --data-binary @s2.json.gz
+curl -sS -G http://localhost:8000/logs/search \
+  --data-urlencode "cursor=$CUR" --data-urlencode 'page_size=1'
+# 上面仍只返回首页查询时已提交批次范围内的结果（不含新批次）；
+# 重新发起新查询才能看到新批次：
+curl -sS -G http://localhost:8000/logs/search \
+  --data-urlencode 'q=error' --data-urlencode 'page_size=10'
+
+# 游标无状态：服务重启后仍可用同一个游标续页
+docker compose restart api
+curl -sS -G http://localhost:8000/logs/search \
+  --data-urlencode "cursor=$CUR" --data-urlencode 'page_size=1'
 ```
 
 ### 失败示例

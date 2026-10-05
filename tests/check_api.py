@@ -1,4 +1,5 @@
 """端到端检查：需要一个已启动的 uvicorn（见下方 BASE）。"""
+import base64
 import gzip
 import io
 import json
@@ -6,6 +7,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 
 import httpx
 
@@ -49,6 +51,9 @@ def list_batch_ids():
 
 def main():
     c = httpx.Client(base_url=BASE, timeout=30)
+    # 每次运行独立的检索标记，避免与历史运行留在库里的数据互相干扰
+    tok = uuid.uuid4().hex[:10]
+    mark = f"slowmark{uuid.uuid4().hex[:10]}"
 
     print("== 正常路径 ==")
     before = list_batch_ids()
@@ -183,7 +188,8 @@ def main():
     # 每条记录带不同的不可压缩内容：压缩后仍足够大，上传可持续数秒；
     # 总解压量约 500*1280B ≈ 640KB，接收中就会多次刷入独立暂存文件
     slow_payload = gz(b"".join(
-        json.dumps({"id": f"s{i:06d}", "message": os.urandom(600).hex()})
+        json.dumps({"id": f"s{i:06d}",
+                    "message": os.urandom(600).hex() + " " + mark})
             .encode() + b"\n"
         for i in range(500)
     ))
@@ -238,6 +244,11 @@ def main():
     check("fast batch visible, slow still invisible",
           ids_after_fast == before_slow | {fast_bid},
           f"extra={ids_after_fast - before_slow - {fast_bid}}")
+    # 暂存中的批次不参与检索：慢上传的标记此刻应查不到任何行
+    r = c.get("/logs/search", params={"q": mark, "page_size": 100})
+    check("staging rows not searchable mid-flight",
+          r.status_code == 200 and r.json()["items"] == []
+          and r.json()["next_cursor"] is None, r.text[:150])
     t.join()
     check("slow upload took its time", "r" in result
           and result["r"].status_code == 201,
@@ -250,6 +261,150 @@ def main():
     check("slow batch lines ordered",
           [(i["seq"], i["id"]) for i in r.json()["items"]]
           == [(1, "s000000"), (2, "s000001"), (3, "s000002")])
+    # 提交后整批可被检索：用游标翻页数满 500 行
+    total, cursor = 0, None
+    while True:
+        params = {"page_size": 100}
+        params["q" if cursor is None else "cursor"] = mark if cursor is None else cursor
+        body = c.get("/logs/search", params=params).json()
+        total += len(body["items"])
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+    check("slow batch searchable after commit (500 hits)", total == 500, str(total))
+
+    print("== 日志检索 ==")
+    s1 = [
+        {"id": "dup", "message": f"{tok} Error disk_full"},
+        {"id": "m2", "message": f"{tok} error diskXfull"},
+        {"id": "m3", "message": f"{tok} plain"},
+        {"id": "m4", "message": f"{tok}_score"},
+        {"id": "m5", "message": f"{tok}Xscore"},
+        {"id": "m6", "message": f"{tok}%"},
+    ]
+    r = c.post("/batches", content=gz(ndjson(s1)))
+    check("search fixture batch1 -> 201", r.status_code == 201, r.text)
+    sb1 = r.json()["batch_id"]
+
+    def search(params):
+        return c.get("/logs/search", params=params)
+
+    r = search({"q": f"{tok} Error", "page_size": 10})
+    check("search 200", r.status_code == 200, r.text[:200])
+    body = r.json()
+    check("case sensitive: Error", [i["id"] for i in body["items"]] == ["dup"], body)
+    check("single page -> null cursor", body["next_cursor"] is None, body)
+    check("item fields",
+          all(set(i) == {"batch_id", "seq", "id", "message"} for i in body["items"]))
+    check("item batch_id & seq",
+          (body["items"][0]["batch_id"], body["items"][0]["seq"]) == (sb1, 1))
+
+    r = search({"q": f"{tok} error", "page_size": 10})
+    check("case sensitive: error", [i["id"] for i in r.json()["items"]] == ["m2"])
+
+    r = search({"q": f"{tok}%", "page_size": 10})
+    check("% is literal", [i["id"] for i in r.json()["items"]] == ["m6"],
+          r.text[:200])
+
+    r = search({"q": f"{tok}_score", "page_size": 10})
+    check("_ is literal", [i["id"] for i in r.json()["items"]] == ["m4"],
+          r.text[:200])
+
+    r = search({"q": f" {tok}%", "page_size": 10})
+    check("whitespace preserved (not stripped)", r.json()["items"] == [])
+
+    r = search({"q": f"{tok}-no-such", "page_size": 10})
+    body = r.json()
+    check("no match -> empty items + null cursor",
+          body["items"] == [] and body["next_cursor"] is None, body)
+
+    # 分页 + 快照：翻页之间提交的新批次不混入旧查询，但新查询可见
+    r = search({"q": tok, "page_size": 2})
+    body = r.json()
+    check("page1", [(i["batch_id"], i["seq"], i["id"]) for i in body["items"]]
+          == [(sb1, 1, "dup"), (sb1, 2, "m2")], body)
+    check("page1 has cursor", bool(body["next_cursor"]))
+    cur1 = body["next_cursor"]
+
+    s2 = [{"id": "dup", "message": f"{tok} second batch"}]
+    r = c.post("/batches", content=gz(ndjson(s2)))
+    check("search fixture batch2 -> 201", r.status_code == 201, r.text)
+    sb2 = r.json()["batch_id"]
+
+    r = search({"cursor": cur1, "page_size": 2})
+    body = r.json()
+    check("page2 keeps snapshot (new batch not mixed in)",
+          [i["id"] for i in body["items"]] == ["m3", "m4"], body)
+    cur2 = body["next_cursor"]
+    check("page2 has cursor", bool(cur2))
+
+    r = search({"cursor": cur2, "page_size": 2})
+    body = r.json()
+    check("page3 (last page) -> null cursor",
+          [i["id"] for i in body["items"]] == ["m5", "m6"]
+          and body["next_cursor"] is None, body)
+
+    r = search({"q": tok, "page_size": 100})
+    body = r.json()
+    ids = [i["id"] for i in body["items"]]
+    check("new query sees new batch",
+          ids == ["dup", "m2", "m3", "m4", "m5", "m6", "dup"], ids)
+    check("same id across batches kept", ids.count("dup") == 2)
+    check("ordered by commit order then seq",
+          [i["batch_id"] for i in body["items"]] == [sb1] * 6 + [sb2]
+          and [i["seq"] for i in body["items"]] == [1, 2, 3, 4, 5, 6, 1])
+
+    print("== 检索参数校验 ==")
+    check("no q no cursor -> 422",
+          search({"page_size": 10}).status_code == 422)
+    check("q and cursor -> 422",
+          search({"q": tok, "cursor": cur1, "page_size": 10}).status_code == 422)
+    check("empty q -> 422", search({"q": "", "page_size": 10}).status_code == 422)
+    check("q 201 chars -> 422",
+          search({"q": "x" * 201, "page_size": 10}).status_code == 422)
+    check("q 200 chars ok",
+          search({"q": "x" * 200, "page_size": 10}).status_code == 200)
+    check("missing page_size -> 422", search({"q": tok}).status_code == 422)
+    check("page_size 0 -> 422",
+          search({"q": tok, "page_size": 0}).status_code == 422)
+    check("page_size 101 -> 422",
+          search({"q": tok, "page_size": 101}).status_code == 422)
+    check("page_size 100 ok",
+          search({"q": tok, "page_size": 100}).status_code == 200)
+    check("page_size non-int -> 422",
+          search({"q": tok, "page_size": "abc"}).status_code == 422)
+    check("garbage cursor -> 422", search({"cursor": "!!!"}).status_code == 422)
+    not_json = base64.urlsafe_b64encode(b"not json").decode().rstrip("=")
+    check("base64 non-json cursor -> 422",
+          search({"cursor": not_json}).status_code == 422)
+
+    def make_cursor(obj):
+        raw = json.dumps(obj).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    check("cursor bad version -> 422",
+          search({"cursor": make_cursor(
+              {"v": 2, "q": "x", "bound": 1, "last": [1, 1]})}).status_code == 422)
+    check("cursor empty q -> 422",
+          search({"cursor": make_cursor(
+              {"v": 1, "q": "", "bound": 1, "last": [1, 1]})}).status_code == 422)
+    check("cursor q too long -> 422",
+          search({"cursor": make_cursor(
+              {"v": 1, "q": "x" * 201, "bound": 1, "last": [1, 1]})}).status_code == 422)
+    check("cursor negative bound -> 422",
+          search({"cursor": make_cursor(
+              {"v": 1, "q": "x", "bound": -1, "last": [1, 1]})}).status_code == 422)
+    check("cursor bad last -> 422",
+          search({"cursor": make_cursor(
+              {"v": 1, "q": "x", "bound": 1, "last": [1]})}).status_code == 422)
+    check("cursor bool in last -> 422",
+          search({"cursor": make_cursor(
+              {"v": 1, "q": "x", "bound": 1, "last": [1, True]})}).status_code == 422)
+    check("cursor missing field -> 422",
+          search({"cursor": make_cursor(
+              {"v": 1, "q": "x", "bound": 1})}).status_code == 422)
+    check("truncated valid cursor -> 422",
+          search({"cursor": cur1[:-3]}).status_code == 422)
 
     print("== 暂存清理 ==")
     import glob as _glob

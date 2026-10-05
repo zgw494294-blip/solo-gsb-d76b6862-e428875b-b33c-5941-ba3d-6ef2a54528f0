@@ -1,6 +1,8 @@
 """FastAPI 入口：gzip NDJSON 批次接收与查询。"""
 from __future__ import annotations
 
+import base64
+import json
 import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any
@@ -10,6 +12,13 @@ from fastapi.responses import JSONResponse
 
 from . import db, ingest
 from .ingest import IngestError, PayloadTooLarge
+
+# 检索查询词长度限制（字符数，空白原样保留、不计入修剪）
+QUERY_MIN_LEN = 1
+QUERY_MAX_LEN = 200
+# 游标版本与传输长度上限（防御性限制，超限同样判为非法游标）
+CURSOR_VERSION = 1
+CURSOR_MAX_LEN = 4096
 
 
 @asynccontextmanager
@@ -101,3 +110,100 @@ def get_batch_lines(
                 ],
             }
         )
+
+
+# --------------------------------------------------------------------------- #
+# 日志检索：无状态游标（自包含、可重启后续用）+ 键集分页
+# --------------------------------------------------------------------------- #
+def _encode_cursor(query: str, boundary: int, last: tuple[int, int]) -> str:
+    """把续页状态编码为无状态游标：不含任何服务端状态，重启后仍可续用。"""
+    payload = json.dumps(
+        {"v": CURSOR_VERSION, "q": query, "bound": boundary, "last": list(last)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    # 去掉填充等号，游标可原样放进 URL 查询串
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _decode_cursor(token: str) -> tuple[str, int, tuple[int, int]]:
+    """解析并校验游标；任何损坏或字段不合法都返回 422。"""
+    if not token or len(token) > CURSOR_MAX_LEN:
+        raise HTTPException(status_code=422, detail="invalid cursor")
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        state = json.loads(
+            base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+        )
+    except ValueError:
+        raise HTTPException(status_code=422, detail="invalid cursor")
+    if (
+        not isinstance(state, dict)
+        or set(state) != {"v", "q", "bound", "last"}
+        or state["v"] != CURSOR_VERSION
+        or not isinstance(state["q"], str)
+        or not (QUERY_MIN_LEN <= len(state["q"]) <= QUERY_MAX_LEN)
+        or not _is_int(state["bound"])
+        or state["bound"] < 0
+        or not isinstance(state["last"], list)
+        or len(state["last"]) != 2
+        or not all(_is_int(p) and p >= 0 for p in state["last"])
+    ):
+        raise HTTPException(status_code=422, detail="invalid cursor")
+    return state["q"], state["bound"], (state["last"][0], state["last"][1])
+
+
+@app.get("/logs/search")
+def search_logs(
+    q: str | None = Query(
+        default=None, min_length=QUERY_MIN_LEN, max_length=QUERY_MAX_LEN
+    ),
+    page_size: int = Query(ge=1, le=100),
+    cursor: str | None = Query(default=None),
+) -> JSONResponse:
+    """按 message 字面子串检索所有已提交批次（大小写敏感，%/_ 无通配含义）。
+
+    首页传 q（1~200 字符，空白原样保留）与 page_size（1~100），并固定
+    当时已提交的批次范围；续页只传 cursor 与 page_size，沿用首页的查询词
+    与范围，翻页期间新提交的批次不会混入。每页一个短查询，不缓存全量命中、
+    不跨请求持有事务，WAL 下检索与上传提交互不阻塞。
+    """
+    if (q is None) == (cursor is None):
+        raise HTTPException(
+            status_code=422, detail="provide exactly one of 'q' and 'cursor'"
+        )
+    if cursor is not None:
+        query, boundary, last = _decode_cursor(cursor)
+    else:
+        # 首页：固定当前已提交批次范围（batches 最大 rowid；批次只增不改）
+        query, last = q, (0, 0)
+        with db.session() as conn:
+            boundary = db.committed_boundary(conn)
+
+    # 多取一行判断是否还有下一页
+    with db.session() as conn:
+        rows = db.search_lines(conn, query, boundary, last, page_size + 1)
+
+    items = rows[:page_size]
+    next_cursor = None
+    if len(rows) > page_size:
+        tail = items[-1]
+        next_cursor = _encode_cursor(query, boundary, (tail["browid"], tail["seq"]))
+    return JSONResponse(
+        {
+            "items": [
+                {
+                    "batch_id": row["batch_id"],
+                    "seq": row["seq"],
+                    "id": row["id"],
+                    "message": row["message"],
+                }
+                for row in items
+            ],
+            "next_cursor": next_cursor,
+        }
+    )

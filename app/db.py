@@ -120,6 +120,54 @@ def get_lines(
     ).fetchall()
 
 
+def committed_boundary(conn: sqlite3.Connection) -> int:
+    """当前已提交批次范围的上界（batches 的最大 rowid，无批次时为 0）。
+
+    批次只增不改、rowid 即提交顺序：固定该上界后，之后提交的批次
+    （rowid 更大）不会混入基于该边界的检索，新查询重新取边界即可看到。
+    """
+    return conn.execute(
+        "SELECT COALESCE(MAX(rowid), 0) AS m FROM batches"
+    ).fetchone()["m"]
+
+
+def search_lines(
+    conn: sqlite3.Connection,
+    query: str,
+    boundary: int,
+    last: tuple[int, int],
+    limit: int,
+) -> list[sqlite3.Row]:
+    """在 rowid <= boundary 的已提交批次内按字面子串匹配 message。
+
+    instr() 是大小写敏感的字面子串匹配，% 与 _ 没有通配含义。
+    结果按批次提交顺序（batches.rowid）、批内 seq 升序；last 为上一页
+    最后一行的 (批次 rowid, seq)，键集分页每次只取其后最多 limit 行，
+    不物化全部命中。CROSS JOIN 固定先按 rowid 顺序扫批次、再沿
+    (batch_id, seq) 主键顺序扫行，ORDER BY 无需排序且 LIMIT 可提前终止。
+    """
+    return conn.execute(
+        """
+        SELECT l.batch_id AS batch_id, l.seq AS seq, l.id AS id,
+               l.message AS message, b.rowid AS browid
+        FROM batches b CROSS JOIN lines l ON l.batch_id = b.id
+        WHERE b.rowid <= :boundary
+          AND b.rowid >= :last_b
+          AND (b.rowid > :last_b OR l.seq > :last_seq)
+          AND instr(l.message, :query) > 0
+        ORDER BY b.rowid, l.seq
+        LIMIT :limit
+        """,
+        {
+            "boundary": boundary,
+            "last_b": last[0],
+            "last_seq": last[1],
+            "query": query,
+            "limit": limit,
+        },
+    ).fetchall()
+
+
 @contextmanager
 def session() -> Iterator[sqlite3.Connection]:
     conn = connect()
