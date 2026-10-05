@@ -1,0 +1,271 @@
+"""端到端检查：需要一个已启动的 uvicorn（见下方 BASE）。"""
+import gzip
+import io
+import json
+import os
+import sqlite3
+import threading
+import time
+
+import httpx
+
+BASE = os.environ.get("BASE", "http://127.0.0.1:8011")
+DB_PATH = os.environ.get("CHECK_DB_PATH", "/tmp/ndjson_check/batches.db")
+
+passed = 0
+failed = []
+
+
+def check(name, cond, extra=""):
+    global passed
+    if cond:
+        passed += 1
+        print(f"  PASS {name}")
+    else:
+        failed.append(name)
+        print(f"  FAIL {name} {extra}")
+
+
+def gz(data: bytes) -> bytes:
+    return gzip.compress(data, mtime=0)
+
+
+def ndjson(records, trailing_newline=True, raw_last: bytes | None = None) -> bytes:
+    buf = b"".join(
+        (json.dumps(r, ensure_ascii=False).encode() + b"\n") for r in records
+    )
+    if not trailing_newline:
+        buf = buf[:-1]
+    if raw_last is not None:
+        buf += raw_last
+    return buf
+
+
+def list_batch_ids():
+    r = httpx.get(f"{BASE}/batches", params={"limit": 1000})
+    r.raise_for_status()
+    return {b["batch_id"] for b in r.json()["items"]}
+
+
+def main():
+    c = httpx.Client(base_url=BASE, timeout=30)
+
+    print("== 正常路径 ==")
+    before = list_batch_ids()
+    recs = [
+        {"id": "a", "message": "hello"},
+        {"id": "b", "message": "世界"},
+        {"id": "c", "message": "x" * 70000},
+    ]
+    # 第三行正文超过 64KiB？message 70000 字节的 ASCII，整行 > 64KiB，应 413
+    r = c.post("/batches", content=gz(ndjson(recs)))
+    check("line >64KiB -> 413", r.status_code == 413, r.text)
+    check("failed upload not listed", list_batch_ids() == before)
+
+    recs = [
+        {"id": "a", "message": "hello"},
+        {"id": "b", "message": "世界"},
+        {"id": "c", "message": "ok"},
+    ]
+    r = c.post("/batches", content=gz(ndjson(recs, trailing_newline=False)))
+    check("normal upload no trailing newline -> 201", r.status_code == 201, r.text)
+    bid = r.json()["batch_id"]
+    check("line_count", r.json()["line_count"] == 3)
+
+    r = c.get(f"{BASE}/batches/{bid}/lines")
+    check("read lines 200", r.status_code == 200)
+    items = r.json()["items"]
+    check(
+        "order & content preserved",
+        [(i["seq"], i["id"], i["message"]) for i in items]
+        == [(1, "a", "hello"), (2, "b", "世界"), (3, "c", "ok")],
+        items,
+    )
+    r = c.get(f"{BASE}/batches/{bid}/lines", params={"limit": 2, "offset": 1})
+    check("pagination", [i["id"] for i in r.json()["items"]] == ["b", "c"])
+    check("pagination total", r.json()["line_count"] == 3)
+
+    r = c.get(f"{BASE}/batches/deadbeef/lines")
+    check("unknown id -> 404", r.status_code == 404, r.status_code)
+
+    r = c.get(f"{BASE}/batches")
+    body = r.json()
+    check("list has new batch", bid in {b["batch_id"] for b in body["items"]})
+    check("list fields", all({"batch_id", "line_count", "created_at"} <= set(b)
+                             for b in body["items"]))
+    r = c.get(f"{BASE}/batches", params={"limit": 1})
+    check("list pagination", len(r.json()["items"]) == 1)
+
+    print("== 422 类 ==")
+    def expect422(name, payload, headers=None):
+        try:
+            r = c.post("/batches", content=payload, headers=headers or {})
+            check(name, r.status_code == 422, f"got {r.status_code} {r.text[:200]}")
+        except httpx.HTTPError as e:
+            check(name, False, f"client error {e}")
+
+    expect422("empty body -> 422", b"")
+    expect422("gzip of empty -> 422", gz(b""))
+    expect422("corrupt gzip -> 422", b"\x1f\x8b\x08not really gzip")
+    good = gz(ndjson([{"id": "a", "message": "m"}]))
+    expect422("trailing data -> 422", good + b"X")
+    expect422("truncated gzip -> 422", good[:-8])
+    # 故意改坏 CRC（gzip 尾部倒数第 8 字节起）
+    bad_crc = bytearray(good)
+    bad_crc[-8] ^= 0xFF
+    expect422("bad CRC -> 422", bytes(bad_crc))
+    expect422("empty line -> 422", gz(b'{"id":"a","message":"m"}\n\n'))
+    expect422("leading empty line -> 422", gz(b'\n{"id":"a","message":"m"}\n'))
+    expect422("invalid JSON -> 422", gz(b'{not json\n'))
+    expect422("invalid UTF-8 -> 422", gz(b'{"id":"a","message":"\xff"}\n'))
+    expect422("missing key -> 422", gz(b'{"id":"a"}\n'))
+    expect422("extra key -> 422", gz(b'{"id":"a","message":"m","x":1}\n'))
+    expect422("empty id -> 422", gz(b'{"id":"","message":"m"}\n'))
+    expect422("empty message -> 422", gz(b'{"id":"a","message":""}\n'))
+    expect422("non-string id -> 422", gz(b'{"id":1,"message":"m"}\n'))
+    expect422("null message -> 422", gz(b'{"id":"a","message":null}\n'))
+    expect422("duplicate id in batch -> 422",
+              gz(b'{"id":"a","message":"1"}\n{"id":"a","message":"2"}\n'))
+    expect422("json number top-level -> 422", gz(b'123\n'))
+    expect422("duplicate json key -> 422",
+              gz(b'{"id":"a","id":"b","message":"m"}\n'))
+    # 第二条记录坏：第一条不得变可见
+    expect422("bad 2nd record -> 422",
+              gz(b'{"id":"z1","message":"m"}\n{"id":"z2","message":}\n'))
+    check("no zombie batch from failures", list_batch_ids() == before | {bid})
+
+    print("== 413 类 ==")
+    # 解压后 >8MiB（高压缩比，压缩体远小于 2MiB）；id 必须唯一
+    big_lines = b"".join(
+        b'{"id":"%07d","message":"aaaaaaaa"}\n' % i for i in range(290_000)
+    )
+    check("fixture decompressed size > 8MiB",
+          len(big_lines) > 8 * 1024 * 1024, str(len(big_lines)))
+    check("fixture compressed size < 2MiB",
+          len(gz(big_lines)) <= 2 * 1024 * 1024, str(len(gz(big_lines))))
+    r = c.post("/batches", content=gz(big_lines))
+    check("decompressed >8MiB -> 413", r.status_code == 413, r.text[:120])
+
+    # 边界：单行恰好 64KiB（整行字节）合法；用紧凑分隔符精确构造
+    skeleton = json.dumps(
+        {"id": "boundary", "message": ""}, separators=(",", ":")).encode()
+    msg = "y" * (64 * 1024 - len(skeleton))
+    raw = json.dumps(
+        {"id": "boundary", "message": msg}, separators=(",", ":")).encode()
+    check("fixture line exactly 64KiB", len(raw) == 64 * 1024, str(len(raw)))
+    r = c.post("/batches", content=gz(raw))
+    check("line exactly 64KiB -> 201", r.status_code == 201, r.text[:150])
+    if r.status_code == 201:
+        boundary_bid = r.json()["batch_id"]
+    else:
+        boundary_bid = None
+    committed_so_far = before | {bid}
+    if boundary_bid:
+        committed_so_far |= {boundary_bid}
+
+    # 单行 >64KiB（非 JSON 也先判字节）
+    r = c.post("/batches", content=gz(b"x" * 70000 + b"\n"))
+    check("single line >64KiB -> 413", r.status_code == 413, r.text[:120])
+
+    # 压缩体 >2MiB：合法 gzip 封装的不可压缩数据（约 3MiB），服务端中途即停
+    over = gz(os.urandom(3 * 1024 * 1024))
+    try:
+        r = c.post("/batches", content=over)
+        check("compressed >2MiB -> 413",
+              r.status_code == 413, f"got {r.status_code}")
+    except httpx.HTTPError:
+        # 服务端已立即回 413 并关连接，客户端写剩余 body 时可能感知到断连
+        check("compressed >2MiB -> 413 (connection closed)", True)
+
+    check("still no zombie batches", list_batch_ids() == committed_so_far)
+
+    print("== 并发：慢上传不阻塞其它请求，且完成前不可见 ==")
+    # 每条记录带不同的不可压缩内容：压缩后仍足够大，上传可持续数秒；
+    # 总解压量约 500*1280B ≈ 640KB，接收中就会多次刷入独立暂存文件
+    slow_payload = gz(b"".join(
+        json.dumps({"id": f"s{i:06d}", "message": os.urandom(600).hex()})
+            .encode() + b"\n"
+        for i in range(500)
+    ))
+    chunks = [slow_payload[i:i + 1000]
+              for i in range(0, len(slow_payload), 1000)]
+    total_seconds = len(chunks) * 0.05
+    check("slow upload lasts several seconds", total_seconds > 5,
+          f"{total_seconds:.1f}s, {len(slow_payload)} compressed bytes")
+
+    def gen():
+        for ch in chunks:
+            time.sleep(0.05)
+            yield ch
+
+    result = {}
+    def slow_post():
+        try:
+            with httpx.Client(base_url=BASE, timeout=60) as cc:
+                result["r"] = cc.post("/batches", content=gen())
+        except Exception as e:
+            result["e"] = e
+
+    t = threading.Thread(target=slow_post)
+    before_slow = list_batch_ids()
+    t.start()
+    time.sleep(1.5)  # 慢上传进行中
+    ids_mid = list_batch_ids()
+    check("no new batch visible mid-flight", ids_mid == before_slow,
+          f"extra={ids_mid - before_slow}")
+    # 每批次独占一个暂存 SQLite 文件；接收中应已创建并有内容落盘，
+    # 但主库里绝不可见
+    import glob as _glob
+    stage_files = [p for p in _glob.glob(
+        os.path.join(os.path.dirname(DB_PATH), "staging", "stage_*.db"))]
+    stage_size = sum(os.path.getsize(p) for p in stage_files)
+    check("dedicated staging file present mid-flight",
+          len(stage_files) == 1 and stage_size > 0,
+          f"files={stage_files} size={stage_size}")
+    t0 = time.time()
+    r1 = c.get("/batches")
+    read_ms = (time.time() - t0) * 1000
+    t0 = time.time()
+    r2 = c.post("/batches",
+                content=gz(ndjson([{"id": "fast1", "message": "go"}])))
+    post_ms = (time.time() - t0) * 1000
+    fast_bid = r2.json()["batch_id"]
+    check("read during slow upload fast", read_ms < 3000, f"{read_ms:.0f}ms")
+    check("another submit during slow upload fast -> 201",
+          r2.status_code == 201 and post_ms < 3000,
+          f"{r2.status_code} {post_ms:.0f}ms")
+    ids_after_fast = list_batch_ids()
+    check("fast batch visible, slow still invisible",
+          ids_after_fast == before_slow | {fast_bid},
+          f"extra={ids_after_fast - before_slow - {fast_bid}}")
+    t.join()
+    check("slow upload took its time", "r" in result
+          and result["r"].status_code == 201,
+          str(result.get("e", "")))
+    slow_bid = result["r"].json()["batch_id"]
+    check("slow batch visible after completion",
+          slow_bid in list_batch_ids() and slow_bid != fast_bid)
+    check("slow batch line count", result["r"].json()["line_count"] == 500)
+    r = c.get(f"{BASE}/batches/{slow_bid}/lines", params={"limit": 3})
+    check("slow batch lines ordered",
+          [(i["seq"], i["id"]) for i in r.json()["items"]]
+          == [(1, "s000000"), (2, "s000001"), (3, "s000002")])
+
+    print("== 暂存清理 ==")
+    import glob as _glob
+    leftovers = _glob.glob(
+        os.path.join(os.path.dirname(DB_PATH), "staging", "stage_*.db*"))
+    check("no staging files left", leftovers == [], str(leftovers))
+    conn = sqlite3.connect(DB_PATH)
+    orphan_lines = conn.execute(
+        "SELECT count(*) FROM lines WHERE batch_id NOT IN (SELECT id FROM batches)"
+    ).fetchone()[0]
+    check("no orphan lines", orphan_lines == 0, str(orphan_lines))
+    conn.close()
+
+    print(f"\n{passed} passed, {len(failed)} failed: {failed}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
