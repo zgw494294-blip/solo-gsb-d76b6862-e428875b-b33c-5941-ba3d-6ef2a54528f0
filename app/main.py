@@ -8,7 +8,9 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
+from . import cursor as cursor_mod
 from . import db, ingest
+from .cursor import CursorError
 from .ingest import IngestError, PayloadTooLarge
 
 
@@ -101,3 +103,78 @@ def get_batch_lines(
                 ],
             }
         )
+
+
+@app.get("/logs/search")
+def search_logs(
+    q: str | None = Query(default=None, max_length=200),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=100),
+) -> JSONResponse:
+    """跨所有已提交批次按 message 的字面子串检索日志。
+
+    - 大小写敏感、逐字节匹配：``%``、``_`` 等不做通配符，查询词中的空白
+      （含首尾）原样保留；长度 1～200 个字符。
+    - 首请求带 ``q``：页大小 ``limit`` 取 1～100，并固定当时已提交批次
+      范围（快照上界）。续页只带 ``cursor`` 与 ``limit``，查询词与范围沿用
+      首请求；翻页期间新提交的批次不会混入旧查询。暂存中的批次不参与。
+    - 游标已签名且持久化，服务重启后仍可续用；游标损坏或字段不合法返回
+      422。无命中或已到末页时返回空 items / ``next_cursor=null``。
+    """
+    # q 与 cursor 必须二选一：续页沿用首请求查询词，不允许在续页改词
+    if (q is None) == (cursor is None):
+        raise HTTPException(
+            status_code=422,
+            detail="exactly one of query parameters 'q' (first page) or "
+            "'cursor' (next page) is required",
+        )
+    if q is not None and not (1 <= len(q) <= 200):
+        raise HTTPException(
+            status_code=422, detail="q must be 1..200 characters"
+        )
+
+    if cursor is not None:
+        try:
+            state = cursor_mod.decode_cursor(cursor)
+        except CursorError as exc:
+            raise HTTPException(status_code=422, detail=f"invalid cursor: {exc}")
+    else:
+        assert q is not None
+        # 首请求固定快照上界；与检索分属两条短语句，autocommit 下均不持锁
+        with db.session() as conn:
+            bound = db.max_batch_rowid(conn)
+        state = {"q": q, "m": bound, "b": 0, "s": 0}
+
+    with db.session() as conn:
+        # 多取 1 行判断是否有下一页，避免缓存全量命中
+        rows = db.search_lines(
+            conn,
+            state["q"],
+            state["m"],
+            state["b"],
+            state["s"],
+            limit + 1,
+        )
+
+    next_cursor = None
+    if len(rows) > limit:
+        last = rows[limit - 1]
+        next_cursor = cursor_mod.encode_cursor(
+            state["q"], state["m"], last["_browid"], last["seq"]
+        )
+        rows = rows[:limit]
+
+    return JSONResponse(
+        {
+            "items": [
+                {
+                    "batch_id": row["batch_id"],
+                    "seq": row["seq"],
+                    "id": row["id"],
+                    "message": row["message"],
+                }
+                for row in rows
+            ],
+            "next_cursor": next_cursor,
+        }
+    )

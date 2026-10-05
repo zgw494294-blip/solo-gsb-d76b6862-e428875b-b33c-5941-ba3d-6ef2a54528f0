@@ -4,13 +4,24 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
+import uuid
 
 import httpx
 
 BASE = os.environ.get("BASE", "http://127.0.0.1:8011")
 DB_PATH = os.environ.get("CHECK_DB_PATH", "/tmp/ndjson_check/batches.db")
+# tests/ 的上一级即仓库根（含 app/ 包），供“重启”子进程作为工作目录
+WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+try:
+    import uvicorn  # noqa: F401
+
+    HAVE_UVICORN = True
+except Exception:  # 运行检查脚本的解释器未必装了服务依赖
+    HAVE_UVICORN = False
 
 passed = 0
 failed = []
@@ -45,6 +56,285 @@ def list_batch_ids():
     r = httpx.get(f"{BASE}/batches", params={"limit": 1000})
     r.raise_for_status()
     return {b["batch_id"] for b in r.json()["items"]}
+
+
+def search_checks(c: httpx.Client):
+    print("== 日志检索 ==")
+    # 每次运行唯一标记，保证结果不受历史数据影响
+    mk = "ZQ" + uuid.uuid4().hex[:8]
+
+    def srec(i, msg):
+        return {"id": f"{mk}-{i}", "message": msg}
+
+    # 两个批次，提交顺序即排列顺序；刻意制造同 id 跨批
+    batch_a = [
+        srec(1, f"{mk} Hello World"),
+        {"id": "same-id", "message": f"{mk} batch-A row"},
+        srec(3, f"{mk} 100% done_next a_b literal"),
+        srec(4, f"{mk}  double  space"),
+        {"id": "dup-id", "message": f"{mk} DUP first"},
+        srec(6, f"{mk} zzq lowercase marker"),
+    ]
+    batch_b = [
+        {"id": "dup-id", "message": f"{mk} DUP second"},
+        srec(8, f"{mk} world is lowercase here"),
+        {"id": "same-id", "message": f"{mk} batch-B row"},
+    ]
+    bid_a = c.post("/batches", content=gz(ndjson(batch_a))).json()["batch_id"]
+    bid_b = c.post("/batches", content=gz(ndjson(batch_b))).json()["batch_id"]
+
+    def search(params, **kw):
+        return c.get(f"{BASE}/logs/search", params=params, **kw)
+
+    # 基本检索：大小写敏感，按批次提交顺序、批内 seq 升序；同 id 跨批保留
+    r = search({"q": mk, "limit": 100})
+    check("search 200", r.status_code == 200, r.text)
+    body = r.json()
+    check("search fields",
+          all(set(i) == {"batch_id", "seq", "id", "message"} for i in body["items"]),
+          body)
+    check("search item count", len(body["items"]) == 9,
+          f"{len(body['items'])}")
+    check("search order across batches",
+          [(i["batch_id"], i["seq"]) for i in body["items"]]
+          == [(bid_a, 1), (bid_a, 2), (bid_a, 3), (bid_a, 4), (bid_a, 5),
+              (bid_a, 6), (bid_b, 1), (bid_b, 2), (bid_b, 3)],
+          body["items"])
+    check("same id kept across batches",
+          [i["id"] for i in body["items"]].count("dup-id") == 2
+          and [i["id"] for i in body["items"]].count("same-id") == 2)
+    check("search last page cursor null", body["next_cursor"] is None)
+
+    # 大小写敏感：World 只匹配 A 批第 1 行，world 只匹配 B 批第 2 行
+    r = search({"q": f"{mk} Hello World"})
+    check("case sensitive uppercase",
+          [(i["batch_id"], i["seq"]) for i in r.json()["items"]]
+          == [(bid_a, 1)], r.text)
+    r = search({"q": "world"})
+    check("case sensitive lowercase ignores other batches' data",
+          [(i["batch_id"], i["seq"]) for i in r.json()["items"]
+           if mk in i["message"]]
+          == [(bid_b, 2)], r.text)
+    r = search({"q": f"{mk} DUP"})
+    check("case sensitive DUP two rows",
+          len(r.json()["items"]) == 2, r.text)
+    r = search({"q": f"{mk} dup"})
+    check("case sensitive dup zero rows",
+          r.json()["items"] == [] and r.json()["next_cursor"] is None, r.text)
+
+    # % 和 _ 是字面子串，不是通配符
+    r = search({"q": f"{mk} 100% done_next a_b"})
+    check("literal percent/underscore",
+          [(i["batch_id"], i["seq"]) for i in r.json()["items"]]
+          == [(bid_a, 3)], r.text)
+    r = search({"q": f"{mk} 100% done?next a_b"})
+    check("no wildcard matching", r.json()["items"] == [], r.text)
+
+    # 空白保留：连续两个空格命中，单个空格不命中；首尾空白也保留
+    r = search({"q": f"{mk}  double  space"})
+    check("inner double spaces preserved",
+          [(i["batch_id"], i["seq"]) for i in r.json()["items"]]
+          == [(bid_a, 4)], r.text)
+    r = search({"q": f"{mk} double space"})
+    check("single spaces no match", r.json()["items"] == [])
+    r = search({"q": f"  {mk} Hello World   "})
+    check("leading/trailing spaces part of term",
+          r.json()["items"] == [])
+
+    # 无匹配：空 items + null 游标
+    r = search({"q": f"{mk}-definitely-absent"})
+    check("no match empty", r.json() == {"items": [], "next_cursor": None}, r.text)
+
+    # 分页：limit=2 共 5 页（9 行），游标逐页推进且内容与一次性查询一致
+    r = search({"q": mk, "limit": 2})
+    pages = [r.json()["items"]]
+    cursors = [r.json()["next_cursor"]]
+    check("first page size 2", len(pages[0]) == 2)
+    while cursors[-1] is not None:
+        r = search({"cursor": cursors[-1], "limit": 2})
+        check("continuation 200", r.status_code == 200, r.text)
+        pages.append(r.json()["items"])
+        cursors.append(r.json()["next_cursor"])
+    flat = [i for p in pages for i in p]
+    check("pagination page sizes",
+          [len(p) for p in pages] == [2, 2, 2, 2, 1],
+          [len(p) for p in pages])
+    check("pagination cursors then null",
+          all(cur is not None for cur in cursors[:-1]) and cursors[-1] is None)
+    check("pagination content consistent",
+          [(i["batch_id"], i["seq"]) for i in flat]
+          == [(bid_a, n) for n in range(1, 7)]
+          + [(bid_b, n) for n in range(1, 4)],
+          flat)
+
+    # 续页改变页大小仍沿用原查询词与范围
+    r = search({"q": mk, "limit": 4})
+    cur = r.json()["next_cursor"]
+    r = search({"cursor": cur, "limit": 100})
+    check("continue with different page size",
+          [(i["batch_id"], i["seq"]) for i in r.json()["items"]]
+          == [(bid_a, 5), (bid_a, 6), (bid_b, 1), (bid_b, 2), (bid_b, 3)],
+          r.text)
+
+    # 翻页期间新提交批次不混入旧查询
+    r = search({"q": mk, "limit": 3})  # 固定快照，停在 A 批 seq3
+    cur = r.json()["next_cursor"]
+    r_new = c.post(
+        "/batches",
+        content=gz(ndjson([{"id": "late", "message": f"{mk} late batch"}])),
+    )
+    late_bid = r_new.json()["batch_id"]
+    r = search({"cursor": cur, "limit": 100})
+    check("new batch excluded from paged query",
+          late_bid not in {i["batch_id"] for i in r.json()["items"]},
+          r.text)
+    check("paged query continues within old snapshot",
+          [(i["batch_id"], i["seq"]) for i in r.json()["items"]]
+          == [(bid_a, 4), (bid_a, 5), (bid_a, 6), (bid_b, 1), (bid_b, 2),
+              (bid_b, 3)],
+          r.text)
+    check("paged query next null at old snapshot end",
+          r.json()["next_cursor"] is None)
+    # 但新查询能看到新批次
+    r = search({"q": f"{mk} late batch"})
+    check("fresh query sees newly committed batch",
+          [(i["batch_id"], i["seq"]) for i in r.json()["items"]]
+          == [(late_bid, 1)], r.text)
+
+    print("== 检索：暂存批次不参与 ==")
+    # 慢上传进行中：其暂存内容不得被检索命中；快照也不含该批次。
+    # 附带不可压缩随机尾巴，避免压缩体过小导致上传在取样前就结束。
+    slow_text = f"{mk} slow staging 999"
+    slow_payload = gz(b"".join(
+        json.dumps({"id": f"{mk}-sl{i}",
+                    "message": slow_text + os.urandom(300).hex()})
+            .encode() + b"\n"
+        for i in range(60)
+    ))
+    chunks = [slow_payload[i:i + 900]
+              for i in range(0, len(slow_payload), 900)]
+    result = {}
+
+    def slow_post():
+        try:
+            with httpx.Client(base_url=BASE, timeout=60) as cc:
+                result["r"] = cc.post(
+                    "/batches",
+                    content=(ch for ch in _gen_slow(chunks)))
+        except Exception as e:  # noqa: BLE001
+            result["e"] = e
+
+    def _gen_slow(chunks):
+        for ch in chunks:
+            time.sleep(0.05)
+            yield ch
+
+    t = threading.Thread(target=slow_post)
+    t.start()
+    time.sleep(1.0)
+    r = search({"q": slow_text})
+    check("staging rows not searchable mid-flight",
+          r.json()["items"] == [], r.text)
+    t.join()
+    check("slow upload ok", "r" in result and result["r"].status_code == 201,
+          str(result.get("e", "")))
+    slow_bid = result["r"].json()["batch_id"]
+    r = search({"q": slow_text})
+    check("slow batch searchable after commit",
+          len(r.json()["items"]) == 60
+          and {i["batch_id"] for i in r.json()["items"]} == {slow_bid},
+          f"{len(r.json()['items'])}")
+
+    print("== 检索：参数与游标错误 -> 422 ==")
+    def expect422_search(name, params):
+        r = search(params)
+        check(name, r.status_code == 422, f"got {r.status_code} {r.text[:120]}")
+
+    expect422_search("no q and no cursor", {})
+    expect422_search("both q and cursor",
+                     {"q": "x", "cursor": "v1.aaaa.bbbb"})
+    expect422_search("empty q", {"q": ""})
+    expect422_search("q over 200 chars", {"q": "x" * 201})
+    expect422_search("limit zero", {"q": "x", "limit": 0})
+    expect422_search("limit 101", {"q": "x", "limit": 101})
+    expect422_search("garbage cursor", {"cursor": "not-a-cursor"})
+    expect422_search("bad version cursor", {"cursor": "v2.aa.bb"})
+    r = search({"q": mk, "limit": 3})
+    if r.json()["next_cursor"]:
+        good_cur = r.json()["next_cursor"]
+        head, payload, sig = good_cur.split(".")
+        expect422_search("tampered signature",
+                         {"cursor": f"{head}.{payload}.{sig[:-1]}A"})
+        expect422_search("tampered payload",
+                         {"cursor": f"{head}.{payload[:-1]}A.{sig}"})
+    else:
+        check("obtain real cursor for tamper tests", False, "no cursor")
+    expect422_search("cursor not base64",
+                     {"cursor": "v1.!!!.bbb"})
+    r = search({"q": "   "})
+    check("whitespace-only q -> 200", r.status_code == 200, r.text)
+
+    print("== 检索：游标在服务重启后仍可续用 ==")
+    if not HAVE_UVICORN:
+        check("restart continuation (skipped: no uvicorn in test interpreter)",
+              True)
+    else:
+        port = 8023
+        env = dict(os.environ)
+        env["DB_PATH"] = DB_PATH
+        env["PYTHONPATH"] = WORKSPACE_ROOT
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "app.main:app",
+             "--host", "127.0.0.1", "--port", str(port)],
+            cwd=WORKSPACE_ROOT,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            base2 = f"http://127.0.0.1:{port}"
+            deadline = time.time() + 20
+            up = False
+            while time.time() < deadline:
+                try:
+                    if httpx.get(f"{base2}/batches", timeout=1).status_code == 200:
+                        up = True
+                        break
+                except httpx.HTTPError:
+                    time.sleep(0.3)
+            check("second instance started on same data dir", up)
+            if up:
+                with httpx.Client(base_url=base2, timeout=20) as c2:
+                    r = c2.get(f"{base2}/logs/search",
+                               params={"q": mk, "limit": 3})
+                    check("new process queries same data",
+                          r.status_code == 200 and len(r.json()["items"]) == 3,
+                          r.text[:120])
+                    cur2 = r.json()["next_cursor"]
+                    check("new process issues cursor", cur2 is not None)
+                    # 用原服务首请求签发的游标访问新进程（模拟重启后续页）：
+                    # cursors[0] 指向 A 批 seq2，续页应为 A 批 seq3、seq4
+                    r = c2.get(f"{base2}/logs/search",
+                               params={"cursor": cursors[0], "limit": 2})
+                    check("old cursor survives restart (page 2)",
+                          r.status_code == 200
+                          and [(i["batch_id"], i["seq"]) for i in r.json()["items"]]
+                          == [(bid_a, 3), (bid_a, 4)],
+                          r.text[:160])
+                    # 反过来：新进程签发的游标原服务也能续用。该游标快照固定在
+                    # 晚到批次/慢批次提交之后，但起点仍是 A 批 seq3
+                    r = search({"cursor": cur2, "limit": 100})
+                    check("cursor from restarted process usable",
+                          r.status_code == 200
+                          and [(i["batch_id"], i["seq"]) for i in r.json()["items"][:3]]
+                          == [(bid_a, 4), (bid_a, 5), (bid_a, 6)],
+                          r.text[:200])
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 def main():
@@ -262,6 +552,8 @@ def main():
     ).fetchone()[0]
     check("no orphan lines", orphan_lines == 0, str(orphan_lines))
     conn.close()
+
+    search_checks(c)
 
     print(f"\n{passed} passed, {len(failed)} failed: {failed}")
     return 1 if failed else 0

@@ -120,6 +120,57 @@ def get_lines(
     ).fetchall()
 
 
+# --------------------------------------------------------------------------- #
+# 日志检索（字面子串、固定已提交批次快照、键集分页）
+# --------------------------------------------------------------------------- #
+def max_batch_rowid(conn: sqlite3.Connection) -> int:
+    """当前已提交批次的最大 rowid（即提交顺序上界）；无批次时为 0。"""
+    return conn.execute(
+        "SELECT coalesce(max(rowid), 0) AS m FROM batches"
+    ).fetchone()["m"]
+
+
+def search_lines(
+    conn: sqlite3.Connection,
+    query: str,
+    max_batch_rowid_bound: int,
+    after_batch_rowid: int,
+    after_seq: int,
+    limit: int,
+) -> list[sqlite3.Row]:
+    """在固定快照（batches.rowid <= max_batch_rowid_bound）内做键集分页检索。
+
+    - instr 为二进制逐字节匹配：大小写敏感，% 和 _ 只是普通字符；
+    - 排序按批次提交顺序（batches.rowid），批内按 seq 升序；
+    - 只取 limit 行（调用方传 limit+1 判断是否有下一页），不缓存全量命中；
+    - 连接为 autocommit，只读语句的隐式事务在语句结束即释放，不跨请求持有。
+    """
+    return conn.execute(
+        """
+        SELECT b.rowid AS _browid,
+               l.batch_id AS batch_id,
+               l.seq      AS seq,
+               l.id       AS id,
+               l.message  AS message
+        FROM lines l
+        JOIN batches b ON b.id = l.batch_id
+        WHERE b.rowid <= ?
+          AND (b.rowid > ? OR (b.rowid = ? AND l.seq > ?))
+          AND instr(l.message, ?) > 0
+        ORDER BY b.rowid, l.seq
+        LIMIT ?
+        """,
+        (
+            max_batch_rowid_bound,
+            after_batch_rowid,
+            after_batch_rowid,
+            after_seq,
+            query,
+            limit,
+        ),
+    ).fetchall()
+
+
 @contextmanager
 def session() -> Iterator[sqlite3.Connection]:
     conn = connect()
